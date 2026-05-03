@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Oikawa
+    given-names: Taichi
+    orcid: "https://orcid.org/0009-0002-7852-2194"
+  - family-names: Sano
+    given-names: Yuki
+  - family-names: Hiratsuka
+    given-names: Toichi
+title: "Sky Writer: Automatic Recognition of Air-Writing Using Machine Learning"
+version: 0.1.0
+date-released: 2026-05-04
+url: "https://github.com/TaichiOikawa/SkyWriter"

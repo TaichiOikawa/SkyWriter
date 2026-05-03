@@ -1,0 +1,22 @@
+[project]
+name = "skywriter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11.9"
+dependencies = [
+    "google-cloud-vision>=3.13.0",
+    "numpy>=2.4.3",
+    "opencv-python>=4.13.0.92",
+    "opencv-contrib-python>=4.13.0.92",
+    "pillow>=12.1.1",
+    "torch==2.11.0+cu128",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.2",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "mediapipe==0.10.14",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
