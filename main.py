@@ -234,6 +234,7 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
         hand_detected_once = False  # 手が一度でも検出されたかどうか]
         no_hand_count = 0        # 手が検出されないフレームの連続数
         no_hand_flushed = False  # 現在の「手なし」区間で既に区切り処理を行ったか
+        detection_enabled = True  # Enterキーで区切り検出/OCRをON/OFF
 
         # 新しい特徴量のために前フレーム情報を保持
         prev_velocity = 0.0
@@ -328,7 +329,9 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                     frame_width, frame_height, prev_velocity, prev_distance
                 )
                 add_to_buffer(feat)
-                boundary_prob = predict_boundary()
+                # OFF中は推論をスキップ（バッファは埋め続けるのでON復帰後すぐ使える）
+                if detection_enabled:
+                    boundary_prob = predict_boundary()
 
                 # 次フレームのために現在の値を保存
                 diagonal_norm = (frame_width**2 + frame_height**2)**0.5
@@ -383,7 +386,7 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
             sufficient_pause = non_writing_count >= NON_WRITING_FRAMES_THRESHOLD
 
             # 書き始め条件: (LSTM遷移 または ペンダウン) かつ 十分な停止期間
-            writing_start_detected = sufficient_pause and (lstm_state_changed or pen_down_detected)
+            writing_start_detected = detection_enabled and sufficient_pause and (lstm_state_changed or pen_down_detected)
 
             if writing_start_detected:
                 print('--- LSTM Start Detected (書き始め) ---')
@@ -401,7 +404,7 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                     lines = []
 
             # --- 手が画面から消えたら区切りとして確定（最後の文字を取りこぼさない） ---
-            if hand_detected_once and not no_hand_flushed and no_hand_count >= NO_HAND_FRAMES_THRESHOLD:
+            if detection_enabled and hand_detected_once and not no_hand_flushed and no_hand_count >= NO_HAND_FRAMES_THRESHOLD:
                 if board_has_content(board):
                     print('--- No Hand Detected (区切り) ---')
                     submit_ocr(board.copy())
@@ -439,7 +442,10 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
             for line in lines:
                 board = line.to_board(board)
             frame_disp = cv2.addWeighted(frame, 0.5, board, 0.5, 0)
-            if boundary_pred_eff is None:
+            if not detection_enabled:
+                boundary_status = "LSTM: Disabled"
+                status_color = (0, 0, 255)
+            elif boundary_pred_eff is None:
                 boundary_status = f"LSTM: Buffering ({buffer_count}/{SEQ_LEN})"
                 status_color = (0, 200, 200)  # 未判定は黄色
             elif boundary_prob is not None:
@@ -450,6 +456,13 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 status_color = (0, 255, 0) if boundary_pred_eff == 1 else (0, 0, 255)
             cv2.putText(frame_disp, boundary_status, (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+            # OFF中は右上に赤文字でSTOPを表示
+            if not detection_enabled:
+                stop_text = "STOP"
+                (stop_w, stop_h), _ = cv2.getTextSize(stop_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)
+                cv2.putText(frame_disp, stop_text, (frame_disp.shape[1] - stop_w - 10, stop_h + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
             # OCR結果を画面下部に表示
             ocr_disp_text = format_ocr_text(latest_ocr_text, jp_font, frame_width - 50)
@@ -476,9 +489,17 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 # バッファを空にしたので再び未判定状態から始める
                 boundary_pred_eff = None
                 before_boundary_eff = None
+            elif key in (13, 10):  # Enter: 区切り検出 & OCR の ON/OFF
+                detection_enabled = not detection_enabled
+                # 状態をリセットして、復帰直後に誤検出しないようにする
+                boundary_pred_eff = None
+                before_boundary_eff = None
+                non_writing_count = 0
+                no_hand_flushed = True  # 復帰直後に「手なし区切り」が走らないようにする
+                print(f"--- Detection & OCR: {'ON' if detection_enabled else 'OFF'} ---")
 
     # 最終文字のOCR処理（手が消えた時点で区切り済みなら白紙なので送らない）
-    if board_has_content(board):
+    if detection_enabled and board_has_content(board):
         submit_ocr(board)
 
     # シャットダウン: 保留中のOCRがあれば待たずに停止（必要なら wait=True に変更）
