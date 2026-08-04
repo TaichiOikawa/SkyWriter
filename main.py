@@ -16,6 +16,7 @@ import mediapipe as mp
 import numpy as np
 import concurrent.futures
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 from modules.line import Line  # Line class
 from modules.character import CharacterExtractor  # OCR module
@@ -33,21 +34,94 @@ mp_drawing = mp.solutions.drawing_utils
 # Settings
 # ======================
 MODEL_INFO_PATH = "models.json"
-DISTANCE_THRESHOLD = 25  # ピンチ判定閾値
+DISTANCE_THRESHOLD = 30  # ピンチ判定閾値
 SEQ_LEN = 30             # リアルタイム推論用シーケンス長
-NON_WRITING_FRAMES_THRESHOLD = 10  # 書いていないフレーム連続閾値
+NON_WRITING_FRAMES_THRESHOLD = 15  # 書いていないフレーム連続閾値
+NO_HAND_FRAMES_THRESHOLD = 15      # 手が検出されないフレーム連続閾値（この長さで区切りとして確定）
 # LSTM確率のヒステリシス閾値（立ち上がり/立ち下がりで異なる閾値を使いチャタリング防止）
 PRED_ON_THRESH = 0.85
 PRED_OFF_THRESH = 0.5
 GOOGLE_CREDENTIALS_PATH = "./gcp-my_first_project-auth.json"  # Google Cloud認証情報パス
 
 # 入力特徴量
-INPUT_FEATURES = ["thumb_x", "thumb_y", "index_x", "index_y", "distance", "dx", "dy", "velocity", "acceleration", "angle", "distance_change"]
+INPUT_FEATURES = ["thumb_x", "thumb_y", "index_x", "index_y", "distance", "dx", "dy"]
 
 IMAGE_DIR = "separator_images/"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 session_name = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+# OCR結果の画面表示設定
+OCR_FONT_SIZE = 32
+OCR_CHARS_PER_LINE = 24  # 1行あたりの最大文字数（超えたら折り返す）
+OCR_MAX_LINES = 3        # 表示する最大行数（超えたら末尾を優先して表示）
+# 日本語フォント候補（cv2.putTextは日本語非対応のためPILで描画する）
+FONT_CANDIDATES = [
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+]
+
+
+def load_jp_font(size: int = OCR_FONT_SIZE):
+    """日本語が描画できるフォントを読み込む（見つからなければ None）"""
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    print("[WARNING] 日本語フォントが見つかりません。OCRテキストは代替表示になります")
+    return None
+
+
+def format_ocr_text(text: str | None, font=None, max_width: int | None = None) -> str:
+    """OCR結果を画面表示用に整形（改行/空白を除去して折り返し、末尾N行に制限）"""
+    if not text:
+        return ""
+    flat = "".join(text.split())  # 改行・空白を除去
+
+    if font is not None and max_width:
+        # フォントの実測幅で折り返す（画面外へのはみ出しを防ぐ）
+        lines = []
+        current = ""
+        for ch in flat:
+            if current and font.getlength(current + ch) > max_width:
+                lines.append(current)
+                current = ch
+            else:
+                current += ch
+        if current:
+            lines.append(current)
+    else:
+        lines = [flat[i:i + OCR_CHARS_PER_LINE] for i in range(0, len(flat), OCR_CHARS_PER_LINE)]
+
+    return "\n".join(lines[-OCR_MAX_LINES:])
+
+
+def board_has_content(board: np.ndarray, dark_thresh: int = 250) -> bool:
+    """ボードに線が描かれているか（白紙でないか）を判定する"""
+    return bool(np.any(board < dark_thresh))
+
+
+def draw_text_jp(img: np.ndarray, text: str, org, font, color=(255, 255, 255), bg=(0, 0, 0)) -> np.ndarray:
+    """BGR画像に半透明の背景帯付きでテキストを描画する（日本語対応）"""
+    if not text:
+        return img
+    if font is None:
+        # フォントが無い場合は ASCII に落として cv2 で描画
+        fallback = text.replace("\n", " ").encode("ascii", "replace").decode("ascii")
+        cv2.putText(img, fallback, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        return img
+
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img, "RGBA")
+    left, top, right, bottom = draw.multiline_textbbox(org, text, font=font, spacing=6)
+    draw.rectangle((left - 10, top - 8, right + 10, bottom + 8), fill=(bg[2], bg[1], bg[0], 170))
+    draw.multiline_text(org, text, font=font, fill=(color[2], color[1], color[0]), spacing=6)
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
 # ======================
@@ -148,14 +222,18 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
         board = np.ones((frame_height, frame_width, 3), dtype=np.uint8) * 255
         before_point_x = before_point_y = None
         prev_thumb = None
-        before_boundary_eff = 0  # ヒステリシス&ピンチゲート後の有効な境界状態
-        boundary_pred_eff = 0  # 初期値を0に変更（バッファ不足時は書いていないと判定）
+        # ヒステリシス&ピンチゲート後の有効な境界状態
+        # None = 未判定（LSTMのバッファ充填中で0でも1でもない）
+        before_boundary_eff = None
+        boundary_pred_eff = None
         non_writing_count = 0
         lines = []
         is_pen_down = False
         before_is_pen_down = False
         boundary_prob = None
         hand_detected_once = False  # 手が一度でも検出されたかどうか]
+        no_hand_count = 0        # 手が検出されないフレームの連続数
+        no_hand_flushed = False  # 現在の「手なし」区間で既に区切り処理を行ったか
 
         # 新しい特徴量のために前フレーム情報を保持
         prev_velocity = 0.0
@@ -165,6 +243,28 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
         ocr_local = CharacterExtractor(GOOGLE_CREDENTIALS_PATH)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         ocr_futures = []  # 保留中の Future を保持
+        latest_ocr_text = ""  # 画面に表示する最新のOCR結果
+        jp_font = load_jp_font()
+
+        def submit_ocr(img):
+            """1文字分のボード画像をOCRへ送る（no_extract時は連結のみ）"""
+            if not no_extract:
+                def _ocr_job(im):
+                    try:
+                        ocr_local.add_character(im)
+                        return ocr_local.extract_text()
+                    except Exception as e:
+                        return f"OCR error: {e}"
+
+                ocr_futures.append(executor.submit(_ocr_job, img))
+            else:
+                ocr_local.add_character(img)
+
+            if save_image:
+                try:
+                    ocr_local.save_image(f"{IMAGE_DIR}/{session_name}.png")
+                except Exception as e:
+                    print(f"[ERROR] Failed to save image: {e}")
 
         print(f"FPS: {cap.get(cv2.CAP_PROP_FPS)}")
         video = None
@@ -209,6 +309,8 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
             boundary_prob = None  # LSTMの生確率
             if thumb_tips and index_finger_tips:
                 hand_detected_once = True  # 手が検出された
+                no_hand_count = 0
+                no_hand_flushed = False
                 if distance < DISTANCE_THRESHOLD:
                     if before_point_x is not None and before_point_y is not None:
                         if is_pen_down is False:
@@ -243,8 +345,10 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 add_to_buffer(zero_feat)
                 is_pen_down = False
                 non_writing_count += 1
+                no_hand_count += 1
                 # 一度手が検出された後、検出されなくなったら0にする
-                if hand_detected_once:
+                # ただし未判定（バッファ充填中）の間は未判定のまま維持する
+                if hand_detected_once and boundary_pred_eff is not None:
                     boundary_pred_eff = 0
                 # 前フレーム情報もリセット
                 prev_velocity = 0.0
@@ -266,12 +370,14 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 elif is_clearly_writing:
                     boundary_pred_eff = 1
                 else:
+                    # 中間領域は前の状態を維持（未判定なら未判定のまま）
                     boundary_pred_eff = before_boundary_eff
 
             # --- LSTM推論による文字分割判定 ---
             # --- 書き始め(非書字→書字)の検出 ---
 
             # 状態遷移の検出
+            # 未判定(None)からの変化は遷移とみなさない（起動直後に筆跡を消さないため）
             lstm_state_changed = (before_boundary_eff == 0 and boundary_pred_eff == 1)
             pen_down_detected = (before_is_pen_down == False and is_pen_down == True)
             sufficient_pause = non_writing_count >= NON_WRITING_FRAMES_THRESHOLD
@@ -283,33 +389,26 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 print('--- LSTM Start Detected (書き始め) ---')
                 # 書き始め時にボードをリセット（直前の線は残す）
                 last_line = lines[-1] if (len(lines) > 0 and is_pen_down) else None
-                board_copy = board.copy()
 
-                if not no_extract:
-                    # 非同期で OCR を実行するジョブを投げる
-                    def _ocr_job(img):
-                        try:
-                            ocr_local.add_character(img)
-                            return ocr_local.extract_text()
-                        except Exception as e:
-                            return f"OCR error: {e}"
-
-                    future = executor.submit(_ocr_job, board_copy)
-                    ocr_futures.append(future)
-                else:
-                    ocr_local.add_character(board_copy)
-
-                if save_image:
-                    try:
-                        ocr_local.save_image(f"{IMAGE_DIR}/{session_name}.png")
-                    except Exception as e:
-                        print(f"[ERROR] Failed to save image: {e}")
+                # 白紙の場合は区切りとして送らない（空白が連結されるのを防ぐ）
+                if board_has_content(board):
+                    submit_ocr(board.copy())
 
                 board = np.ones_like(board) * 255
                 if last_line is not None:
                     lines = [last_line]
                 else:
                     lines = []
+
+            # --- 手が画面から消えたら区切りとして確定（最後の文字を取りこぼさない） ---
+            if hand_detected_once and not no_hand_flushed and no_hand_count >= NO_HAND_FRAMES_THRESHOLD:
+                if board_has_content(board):
+                    print('--- No Hand Detected (区切り) ---')
+                    submit_ocr(board.copy())
+                    board = np.ones_like(board) * 255
+                    lines = []
+                # 手が消えている間に何度も送らないようにフラグを立てる
+                no_hand_flushed = True
 
             # 次ループのために前回状態を更新
             before_boundary_eff = boundary_pred_eff
@@ -321,19 +420,7 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
             else:
                 non_writing_count = 0
 
-            # フレーム合成
-            for line in lines:
-                board = line.to_board(board)
-            frame_disp = cv2.addWeighted(frame, 0.5, board, 0.5, 0)
-            if len(buffer) >= SEQ_LEN and boundary_prob is not None:
-                boundary_status = f"LSTM: {boundary_pred_eff} prob={boundary_prob:.2f} pinch={'Y' if pinch_active else 'N'}"
-            else:
-                boundary_status = f"LSTM: Buffering ({boundary_pred_eff})"
-            cv2.putText(frame_disp, boundary_status, (10, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if boundary_pred_eff == 1 else (0, 0, 255), 2)
-            cv2.imshow("MediaPipe Hands", frame_disp)
-
-            # 非同期 OCR の完了チェック（完了したら結果を表示）
+            # 非同期 OCR の完了チェック（描画前に行い、同じフレームに結果を反映する）
             if not no_extract and ocr_futures:
                 remaining = []
                 for fut in ocr_futures:
@@ -343,9 +430,35 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                         except Exception as e:
                             text = f"OCR future error: {e}"
                         print("[Async OCR Result]:", text)
+                        latest_ocr_text = text or ""
                     else:
                         remaining.append(fut)
                 ocr_futures = remaining
+
+            # フレーム合成
+            for line in lines:
+                board = line.to_board(board)
+            frame_disp = cv2.addWeighted(frame, 0.5, board, 0.5, 0)
+            if boundary_pred_eff is None:
+                boundary_status = f"LSTM: Buffering ({buffer_count}/{SEQ_LEN})"
+                status_color = (0, 200, 200)  # 未判定は黄色
+            elif boundary_prob is not None:
+                boundary_status = f"LSTM: {boundary_pred_eff} prob={boundary_prob:.2f} pinch={'Y' if pinch_active else 'N'}"
+                status_color = (0, 255, 0) if boundary_pred_eff == 1 else (0, 0, 255)
+            else:
+                boundary_status = f"LSTM: {boundary_pred_eff} (no hand)"
+                status_color = (0, 255, 0) if boundary_pred_eff == 1 else (0, 0, 255)
+            cv2.putText(frame_disp, boundary_status, (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+            # OCR結果を画面下部に表示
+            ocr_disp_text = format_ocr_text(latest_ocr_text, jp_font, frame_width - 50)
+            if ocr_disp_text:
+                line_count = ocr_disp_text.count("\n") + 1
+                text_y = frame_height - 20 - line_count * (OCR_FONT_SIZE + 6)
+                frame_disp = draw_text_jp(frame_disp, ocr_disp_text, (15, text_y), jp_font)
+
+            cv2.imshow("MediaPipe Hands", frame_disp)
 
             # 動画書き込み
             if video:
@@ -360,27 +473,13 @@ def main(model_path: str, camera_id: int = 0, no_extract: bool = False, save_ima
                 buffer[:] = 0  # numpy配列をゼロクリア
                 buffer_count = 0  # バッファカウンターをリセット
                 non_writing_count = 0
+                # バッファを空にしたので再び未判定状態から始める
+                boundary_pred_eff = None
+                before_boundary_eff = None
 
-    # 最終文字のOCR処理
-    if not no_extract:
-        # 非同期で OCR を実行するジョブを投げる
-        def _ocr_job(img):
-            try:
-                ocr_local.add_character(img)
-                return ocr_local.extract_text()
-            except Exception as e:
-                return f"OCR error: {e}"
-
-        future = executor.submit(_ocr_job, board)
-        ocr_futures.append(future)
-    else:
-        ocr_local.add_character(board)
-
-    if save_image:
-        try:
-            ocr_local.save_image(f"{IMAGE_DIR}/{session_name}.png")
-        except Exception as e:
-            print(f"[ERROR] Failed to save image: {e}")
+    # 最終文字のOCR処理（手が消えた時点で区切り済みなら白紙なので送らない）
+    if board_has_content(board):
+        submit_ocr(board)
 
     # シャットダウン: 保留中のOCRがあれば待たずに停止（必要なら wait=True に変更）
     try:

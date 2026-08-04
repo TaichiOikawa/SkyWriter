@@ -18,7 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-INPUT_FEATURES = ["thumb_x", "thumb_y", "index_x", "index_y", "distance", "dx", "dy", "velocity", "acceleration", "angle", "distance_change"]
+INPUT_FEATURES = ["thumb_x", "thumb_y", "index_x", "index_y", "distance", "dx", "dy"]
 
 
 # ====== Dataset ======
